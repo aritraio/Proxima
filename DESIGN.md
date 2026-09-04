@@ -21,6 +21,7 @@ the point of the project.
 | Routing | HTTP/1.1 request-target based; one upstream pool; host-based pools are a config extension |
 | Balancing | Round-Robin and Weighted Least-Connections |
 | Health | Active probes (`GET <path>`) with hysteresis; passive connect-failure signal |
+| Observability | RED counters (requests / errors / latency) + internal `/_proxima/metrics` endpoint (§13) |
 | Buffering | One mbuf per direction of travel; payload relayed with zero inter-buffer copies |
 | Parsing | Incremental char-level state machine; no malloc, no string copies during parse |
 
@@ -71,6 +72,9 @@ the point of the project.
   same epoll set.
 * The health checker is not a thread: it is a timer-driven probe conn
   that flows through the same machinery.
+* `g_metrics` (§13) and the pipe pool (§14) are process-level singletons
+  owned by the reactor; health probes and metrics/pipe-pool ops all run
+  in the one thread, so no locks exist anywhere.
 
 ### 2.2 One connection, three buffers
 
@@ -97,14 +101,26 @@ the point of the project.
    fragmented — O(cap) worst case, amortized, and it never runs while a
    parser is mid-message (§5.1).
 4. Optional later fast path: `splice()` fd→pipe→fd for large bodies,
-   bypassing the mbuf entirely — a flag-gated experiment (§12), not v1.
-   Saying "we do one-copy with an optional splice path and here is the
-   measurement that shows whether it matters" beats claiming magic.
+   bypassing the mbuf entirely — flag-gated (default off), not v1.
+   Pipes are borrowed from a process-wide pool (§14), never allocated
+   per conn. Saying "we do one-copy with an optional splice path and
+   here is the measurement" beats claiming magic.
 
-Memory per connection (defaults): `c2u` 64 KiB + `u2c` 64 KiB +
-`stage` 2×`max_head` = 128 KiB → ≈ 256 KiB/conn. At `max_conns = 1024`
-that is ~260 MB; tune `buf_cap`/`max_head` down for larger fan-in. This
-math belongs in the README and in the interview answer.
+**Tiered allocation (hazard 1 — memory scaling).** Buffers are *not*
+all-or-nothing at accept():
+
+| Phase | Buffers live | Idle cost @ defaults |
+|---|---|---|
+| accept() → CS_READ_REQ | `c2u` only (allocated in `conn_accept`) | ~67 KiB (c2u 64 KiB + conn 3 KiB) |
+| CS_SELECT → CS_RELAY | `conn_alloc_buffers()` adds `u2c` + `stage` | ~260 KiB transient per *active* request |
+| keep-alive loopback (row 20) | `conn_free_buffers()` releases `u2c`+`stage` | back to ~67 KiB idle |
+| conn_close() | all buffers destroyed | 0 |
+
+So 10 000 idle/slowloris conns pin ≈ 670 MB instead of ≈ 2.6 GB with
+eager allocation — and a client that connects and trickles a request
+head never causes a `stage` or `u2c` allocation. `c2u` grows (realloc,
+never compact) while the head is parsed, capped at `max_head`;
+head overflow → 431. Sizing stays tunable via `max_head`/`buf_cap`.
 
 ---
 
@@ -116,6 +132,11 @@ registration carries `(conn *, fd_role)` so the state machine always
 receives a fully-qualified `(role, events)` tuple — this removes the
 classic proxy ambiguity of "which side of the exchange does this event
 belong to?".
+
+**EPOLLRDHUP is always armed** (hazard 3): `loop_add()`/`loop_mod()`
+OR it into every conn-fd mask automatically, so half-closes are never
+missed (§3.1 rule 6). The loop also owns the listener fd and the
+graceful-drain lifecycle (§4.8) — both live in event.h's contracts.
 
 ### 3.1 ET invariants (enforced in `conn_pump_*`)
 
@@ -139,10 +160,20 @@ belong to?".
    the upstream socket is blocked (EAGAIN), we remove EPOLLIN from the
    client fd. TCP flow control then pushes back on the client. The
    chain client→proxy→backend is one bounded queue.
+6. **EPOLLRDHUP half-close (hazard 3).** A peer that sends a bare FIN
+   with no payload may otherwise never surface as EPOLLIN once an edge
+   has fired — so `loop_add()`/`loop_mod()` always arm EPOLLRDHUP.
+   When it reports, conn.c sets `client_eof`/`upstream_eof`
+   **immediately** and transitions (§4.3 rows 4/17/21) instead of
+   waiting on a read() that may never come. EOF means "no more input
+   will arrive", *not* "stop relaying": buffered outbound data (e.g.
+   u2c after the backend's FIN) is still flushed to the client before
+   the conn closes. Only after the drain completes does the socket
+   close — clean FIN, never RST.
 
 Level-triggered would forgive sloppy interest handling; ET is what
 separates a toy proxy from a real one and is a superb interview topic —
-these five rules are the whole game.
+these six rules are the whole game.
 
 ### 3.2 Interest-arbitration table (per master state)
 
@@ -181,7 +212,7 @@ Every entry is `(role, event)`:
 |---|---|
 | `(C,IN)` / `(U,IN)` | fd readable (loop pumps until EAGAIN) |
 | `(C,OUT)` / `(U,OUT)` | fd writable — drain queue, or connect() finished (U only) |
-| `(C,EOF)` / `(U,EOF)` | read()==0 or EPOLLRDHUP |
+| `(C,EOF)` / `(U,EOF)` | EPOLLRDHUP (always armed) sets `client_eof`/`upstream_eof` immediately; read()==0 confirms. EOF ⇒ flush buffered outbound data, then close (rule 6) |
 | `(C,ERR)` / `(U,ERR)` | EPOLLERR/EPOLLHUP or write error |
 | `EV_TIMEOUT` | conn timer fired: connect deadline or idle deadline |
 
@@ -211,9 +242,11 @@ with `conn_sync_interest()`.
 | 17 | CS_RELAY | (U,EOF) | framing UNTIL_EOF → resp_done when u2c drains; framing LENGTH with resp_body_left>0 → **truncated**: if partial body already sent, abort silently (can't fix length); else 502 | CS_RELAY / CLOSING |
 | 18 | CS_RELAY | (U,ERR) or EV_TIMEOUT | nothing sent yet → 502/504; else abort silently | CS_CLOSING |
 | 19 | CS_RELAY | chunk watcher fires CHF_END | (chunked responses) resp_done=1 | CS_RELAY |
-| 20 | all | resp_done && u2c empty && stage empty | `keep_alive_ok`? reset request-scoped state (§4.4), arm (C,IN) → CS_READ_REQ : close | CS_READ_REQ / CS_CLOSING |
+| 20 | all | resp_done && u2c empty && stage empty | `keep_alive_ok` (and not draining)? reset request-scoped state (§4.4); `conn_free_buffers()` releases u2c+stage (hazard 1); `mbuf_compact()` c2u so the next head starts at index 0 (§5.1); arm (C,IN) → CS_READ_REQ : close | CS_READ_REQ / CS_CLOSING |
 | 21 | any | (C,ERR/EOF) mid-exchange | abort; `node_end` | CS_CLOSING |
-| 22 | CS_CLOSING | – | unregister fds, `node_end`, free | CS_DONE |
+| 22 | CS_CLOSING | – | unregister fds, `node_end`, release borrowed pipe pair (§14), destroy buffers, free | CS_DONE |
+| 23 | CS_READ_REQ (idle) | drain (§4.8) | `conn_begin_drain`: no buffered/partial request → close immediately (RFC 7230 §6.3 allows dropping idle conns) | CS_CLOSING |
+| 24 | CS_SELECT..CS_RELAY (in-flight) | drain deadline fires | grace exhausted → if nothing sent yet reply 503, else close; clean FIN, no RST | CS_CLOSING |
 
 ### 4.4 Request/response overlap — why the table stays small
 
@@ -231,13 +264,20 @@ terminal flag AND its buffer is drained". Response head parsing is a
 *pump-local* sub-task inside CS_RELAY (rows 14–15). This is the nginx
 two-handler model in miniature and keeps every transition testable.
 
+During graceful drain (hazard 6, §4.8) `keep_alive_ok` is forced to 0,
+so a conn that finishes its response mid-drain exits via row 20's
+"close" branch instead of looping — the rewritten response head then
+carries `Connection: close` and the client sees a clean FIN.
+
 ### 4.5 Keep-alive loop & pipelining
 
 * Client keep-alive is default for HTTP/1.1 (and HTTP/1.0 with
   `Connection: keep-alive`). On row 20 the conn re-enters CS_READ_REQ:
-  parsers are reset, buffers are *not* freed, and any bytes left in c2u
-  (a pipelined next request we already over-read) are fed straight to
-  the fresh parser — bounded pipelining for free.
+  parsers are reset, `u2c`+`stage` are released to the allocator
+  (`conn_free_buffers`, hazard 1), and any bytes left in c2u (a
+  pipelined next request we already over-read) are compacted to index 0
+  and fed straight to the fresh parser — bounded pipelining for free,
+  with the "fresh request starts at index 0" invariant intact (§5.1).
 * v1 reads are framed by Content-Length (§3.1 rule 4) so pipelined
   surplus never mixes into the current body.
 * Backend conns are always closed after the exchange (`Connection:
@@ -268,12 +308,31 @@ error reply, `Connection: close`).
 | Phase | Deadline | On fire |
 |---|---|---|
 | CS_CONNECT | now + connect_timeout | 504 |
-| CS_READ_REQ (no progress) | now + idle_timeout | 408 |
+| CS_READ_REQ (no progress) | now + idle_timeout | 408 (idle conns close *immediately* on drain, §4.8) |
 | CS_RELAY (no progress either direction) | now + idle_timeout | silent abort (client gone or backend hung) |
+| In-flight conn during drain | min(phase deadline, drain grace) | graceful close, no RST (§4.8) |
 
 One reusable `loop_timer` per conn; any progress in `conn_pump_*`
 reschedules it. Health probes reuse the same machinery with their own
 deadline.
+
+### 4.8 Graceful draining (hazard 6 — zero-RST shutdown)
+
+Trigger: `SIGTERM` / `SIGQUIT` → main() sets a flag → an eventfd wakes
+the loop → `loop_begin_drain(grace_ms = 5000)` (event.h):
+
+| loop phase | Behavior |
+|---|---|
+| LOOP_RUNNING | accepting + serving |
+| LOOP_DRAINING | loop closes its listener (`loop_add_listener` owns it — no new clients); every live conn gets `conn_begin_drain(now + grace)`: completely idle conns close now; conns with a request in flight finish it with `keep_alive_ok = 0` (response head advertises `Connection: close`) and a deadline capped at the grace deadline; conns holding a *partial* request (started pre-drain) finish that one exchange, then close |
+| LOOP_STOPPED | conn list empty or grace deadline fired → `loop_stop()`; `loop_run()` returns; process exits 0 |
+
+Idle keep-alive conns may be dropped at any time (RFC 7230 §6.3), so no
+header is required for them — only conns mid-response must negotiate
+close. Nothing in the drain path emits RST: sockets are closed after
+outbound buffers drain (plain `close()`, never `SO_LINGER` 0).
+Deployments remove the box from the LB *before* SIGTERM for true
+zero-downtime.
 
 ---
 
@@ -282,14 +341,35 @@ deadline.
 ### 5.1 Zero-allocation contract
 
 `http_parse()` (http.h) is a pure byte scanner over `[base, base+len)`:
-state, cursor `pos`, and `px_range` offsets — nothing else. Because the
-connection code does **not consume** the buffer while a head is being
-parsed, `off` values are stable across feeds; between feeds the buffer
-only grows at the tail. Limits: >max_head → 431. Recorded header ranges
-(`hname[]/hvalue[]`) plus pre-resolved indexes for the headers we act
-on (`idx_host`, `idx_connection`, …) mean the rewriter and framing logic
-never rescan. Unit tests drive it byte-by-byte and assert the exact
-`HSS_*` state after every byte.
+state, cursor `pos`, and `px_range` offsets — nothing else.
+
+**Compaction-safety invariant (hazard 2).** Recorded ranges are
+offsets from the *message base* (the buffer position parsing started
+at). Two rules keep them valid:
+
+1. While a head is being parsed (parser may still return
+   `HPS_NEED_MORE`) the connection code MUST NOT `mbuf_compact()` or
+   consume the buffer — a memmove would silently relocate every
+   recorded range. The buffer only grows at the tail, via the
+   GROW-ONLY path `mbuf_reserve_append()` (a realloc), which is safe
+   because each `http_parse()` call re-derives `base` from the current
+   `mbuf_head()`; only the ranges recorded by the call that *completes*
+   the head are ever consumed.
+2. `mbuf_compact()` runs only at safe points: between messages (the
+   row-20 loopback, which also re-establishes "a fresh request head
+   always starts at index 0" — so any valid head ≤ `max_head` fits
+   contiguously without compaction) and while streaming a body (no
+   parser ranges live).
+
+The debug backstop `http_parser_ranges_in_bounds(p, live_len)`
+(static inline, in http.h) verifies after every feed that `pos` and all
+recorded ranges lie within the scanned prefix; M1 tests assert it holds
+across every byte-by-byte split, and a corrupted range (what a
+compaction bug would produce) must fail it.
+
+Limits: >max_head → 431. Recorded header ranges (`hname[]/hvalue[]`)
+plus pre-resolved indexes for the headers we act on (`idx_host`,
+`idx_connection`, …) mean the rewriter and framing logic never rescan.
 
 ### 5.2 What we record (not allocate)
 
@@ -354,18 +434,22 @@ Request body handling is the subtle part and is framed exactly:
 | Header | Contents |
 |---|---|
 | `proxy.h` | `px_result`, `fd_role`, `px_range`, defaults, generated-status enum |
-| `buf.h` | `struct mbuf` — linear compacting buffer (§2.2) |
-| `http.h` | `http_parser` (HSS_* scanner), `http_msg` (resolved), `chunk_watch`, framing enums |
-| `conn.h` | `conn_state`, `struct conn` (context), `conn_params`, pumps + handlers |
-| `event.h` | opaque `event_loop`, fd registration, `loop_timer` |
-| `pool.h` | `server_node` (addr, weight, health, active/total/failed), `server_pool`, `pool_pick` |
+| `buf.h` | `struct mbuf` — linear buffer, tiered allocation states + compaction-safety invariants (§2.2, §5.1) |
+| `http.h` | `http_parser` (HSS_* scanner), `http_msg` (resolved), `chunk_watch`, framing enums, `http_parser_ranges_in_bounds()` backstop |
+| `conn.h` | `conn_state`, `struct conn` (context, tiered buffers, pipe pair), `conn_params`, pumps + handlers, `conn_alloc_buffers`/`conn_free_buffers`/`conn_begin_drain` |
+| `event.h` | opaque `event_loop`, listener ownership, always-armed EPOLLRDHUP, drain phases (`loop_phase`), `loop_timer` |
+| `pool.h` | `server_node` (+`anomalies`), `server_pool`, `pool_pick`, inline guarded `node_begin`/`node_end`, `node_lc_score` |
+| `metrics.h` | cacheline-aligned `px_metrics` RED counters + inline recorders + render contract (§13) |
+| `pipe_pool.h` | process-wide splice pipe freelist with mbuf fallback (§14) |
 | `config.h` | `proxy_config` snapshot + file parser |
 | `health.h` | `health_checker` + probe bookkeeping |
 
 `struct conn` layout notes: hot scalars (fds, `want[]`, state flags,
-body counters) are grouped first; parsers (~700 B each) and 256 KiB of
-buffers live at the tail. Conn objects are malloc'd per accept in v1; a
-slab + free-list is an M7 polish item.
+body counters) are grouped first, then parsers (~700 B each); buffers
+are tiered (§2.2), so an idle conn holds only c2u. `struct px_metrics`
+sits on its own cacheline(s) with hot counters first (hazard 7). Conn
+objects are malloc'd per accept in v1; a slab + free-list is an M7
+polish item.
 
 ---
 
@@ -374,14 +458,21 @@ slab + free-list is an M7 polish item.
 * `pool_pick()` returns an UP node or NULL (→ 503).
 * **Round-Robin:** `pool->cursor++ % count`, skipping non-UP nodes,
   weight-blind.
-* **Weighted Least-Connections:** score a node as
-  `ceil(active * 1000 / weight)` using integer arithmetic (scale avoids
-  float and preserves weight ordering); pick the minimum, tie-break by
-  walking from the RR cursor so one idle node can't monopolize. A
-  connect *in progress* counts toward `active` (it will occupy the
-  node), so slow-to-connect backends are naturally penalized.
+* **Weighted Least-Connections:** score a node with
+  `node_lc_score()` = `ceil(active * 1000 / weight)` in integer
+  arithmetic (scale avoids float and preserves weight ordering); pick
+  the minimum, tie-break by walking from the RR cursor so one idle node
+  can't monopolize. A connect *in progress* counts toward `active` (it
+  will occupy the node), so slow-to-connect backends are naturally
+  penalized.
 * Accounting: `node_begin()` at pick, `node_end(ok)` on conn teardown —
-  single-threaded, no locks. Health state is owned by health.c.
+  single-threaded, no locks. **Defensive (hazard 5):** both are static
+  inline; `node_end` refuses to decrement a zero counter — a double
+  `node_end` (or lost `node_begin`) bumps `node->anomalies` and
+  `g_metrics.accounting_anomalies` instead of wrapping `active` to
+  UINT64_MAX and poisoning the WLC score. `node_lc_score` clamps the
+  weight divisor to ≥ 1 even though `pool_add` already rejects
+  weight < 1. Health state is owned by health.c.
 * Weights and addresses come from the config file (§9) at startup.
 
 ---
@@ -451,13 +542,14 @@ only.
 | # | Milestone | Deliverables | Done when |
 |---|---|---|---|
 | M0 | Skeleton | Headers (done), Makefile, `tests/header_smoke.c`, `.gitignore`, CI | `make check` green on macOS + Linux; headers compile `-Wall -Wextra -Werror` |
-| M1 | mbuf + parsers | `src/buf.c`, `src/http.c` | Unit tests: buf compaction vs. a model; parser corpus (valid, LF-only, obs-fold→400, >limit→431, split feeds byte-by-byte incl. every CR/LF boundary, chunked flag, Expect flag); `chunk_watch` incl. trailers + split final chunk; resolve() framing matrix incl. HEAD/204/304 |
-| M2 | Reactor | `src/event.c`, `src/main.c` listener | epoll add/mod/del, ET read-until-EAGAIN proven with a test peer; timer min-heap; graceful SIGINT/SIGTERM; `strace -e epoll_ctl,epoll_wait` shows interest toggling |
-| M3 | Skeleton proxy (no body) | conn.c path: REQ head → pick → connect → send head → resp head → relay → keep-alive | curl -v through proxy to `tests/origin.c`; errors 400/431/408/501/502/503/504 exercised; HEAD/204/304 framing; keep-alive verified (curl two requests one conn); access log correct |
+| M0.5 | Hardening contracts **(this milestone)** | Tiered buffers + alloc/free helpers (h1), compaction-safe parse invariant + `ranges_in_bounds` (h2), EPOLLRDHUP always-armed (h3), `pipe_pool.h` (h4), guarded inline node accounting (h5), drain lifecycle `loop_phase`/`conn_begin_drain` (h6), cacheline-aligned `metrics.h` RED counters + internal route (h7); DESIGN.md §2–§14 updated | `make check` green: new `_Static_assert`s (alignment, layout, ordering) + runtime checks of the inline guards; every hazard has a header contract + a smoke assertion |
+| M1 | mbuf + parsers | `src/buf.c`, `src/http.c` | Unit tests: buf compaction vs. a model + unallocated-state tiering; parser corpus (valid, LF-only, obs-fold→400, >limit→431, split feeds byte-by-byte incl. every CR/LF boundary, chunked flag, Expect flag) with `http_parser_ranges_in_bounds` asserted after EVERY feed; `chunk_watch` incl. trailers + split final chunk; resolve() framing matrix incl. HEAD/204/304 |
+| M2 | Reactor | `src/event.c`, `src/main.c` listener | epoll add/mod/del with RDHUP always armed; ET read-until-EAGAIN proven with a test peer; timer min-heap; RDHUP-bare-FIN test (peer shutdown(SHUT_WR) with no payload → conn closes without a read); drain: SIGTERM → listener closed, idle conns close, in-flight finish; `strace -e epoll_ctl,epoll_wait` shows interest toggling |
+| M3 | Skeleton proxy (no body) | conn.c path: REQ head → pick → connect → send head → resp head → relay → keep-alive | curl -v through proxy to `tests/origin.c`; errors 400/431/408/501/502/503/504 exercised; HEAD/204/304 framing; keep-alive verified (curl two requests one conn); u2c/stage allocation verified deferred to CS_SELECT (mallinfo/proc check); access log correct |
 | M4 | Streaming relay | body pumps + backpressure, chunked responses, 100-continue | 100 MB download + 100 MB upload hash-verified end-to-end; slow-backend test (pause origin) proves client reads stop (backpressure) then resume; wrk small run passes with zero errors |
-| M5 | Pool, balancer, health | config.c, pool.c, health.c, CLI | Unit tests: RR rotation, WLC weight ratios (weight 2 backend gets ~2× traffic under load), node up/down exclusion; config parser tests; live toggle test: kill/restart origin during `wrk` → zero client errors |
-| M6 | Hardening | pipelining leftovers, retry-on-connect-failure (GET/HEAD only, max 1), max_conns cap, timeouts audit | Test: pipeline 10 requests on one conn, all 10 answered in order; origin restart mid-bench → retried requests succeed; fd/conn caps hold |
-| M7 | Perf & polish | writev batching, buffer tuning, `splice()` experiment flag, README metrics, k6 suite, slab allocator | Bench suite §11 reproducible; write-up: numbers + 3 things tried + why; full `-fsanitize=address,undefined` clean under load; TSan clean |
+| M5 | Pool, balancer, health, metrics | config.c, pool.c, health.c, metrics.c, CLI, `/_proxima/metrics` route + SIGUSR1 dump | Unit tests: RR rotation, WLC weight ratios (weight 2 backend gets ~2× traffic under load), node up/down exclusion + anomaly/underflow tests (double `node_end`); config parser tests; metrics endpoint returns 200 text/plain with consistent invariant `total == classes + internal`; live toggle test: kill/restart origin during `wrk` → zero client errors |
+| M6 | Hardening | pipelining leftovers, retry-on-connect-failure (GET/HEAD only, max 1), max_conns cap, drain polish, timeouts audit | Test: pipeline 10 requests on one conn, all 10 answered in order; origin restart mid-bench → retried requests succeed; fd/conn caps hold; SIGTERM under `wrk`: zero RST/errors, exit 0 |
+| M7 | Perf & polish | writev batching, buffer tuning, `splice()` via pipe pool (h4) flag-gated, README metrics, k6 suite, slab allocator | Bench suite §11 reproducible; write-up: numbers + 3 things tried + why; full `-fsanitize=address,undefined` clean under load; TSan clean |
 
 Keep M0–M5 as the "must have" for interviews; M6–M7 are stretch that
 impress if reached.
@@ -485,7 +577,10 @@ impress if reached.
      with body (hash round-trip), 4. chunked response origin, 5.
      truncated response → client sees conn close, 6. 100-continue
      upload, 7. pipelining, 8. every error code (§4.6), 9. keep-alive
-     reuse, 10. backend toggle under load.
+     reuse, 10. backend toggle under load, 11. `GET /_proxima/metrics`
+     → 200 text/plain with the totals invariant (§13), 12. SIGTERM
+     mid-`wrk`: all in-flight requests complete, zero RST errors,
+     process exits 0 (§4.8).
 
 ### 11.3 Load testing (wrk + k6)
 
@@ -545,6 +640,14 @@ Pitfalls (each is a classic proxy bug):
 * Blocking getaddrinfo in the hot path (done once, at startup)
 * Writing `send()` results without handling partial writes
 * Timers that never fire because epoll_wait has no deadline
+* Missing a bare FIN in ET mode because EPOLLRDHUP wasn't armed (§3.1
+  rule 6)
+* `mbuf_compact()` under a live parser, silently corrupting recorded
+  header offsets (§5.1)
+* `node_end()` called twice → `active` underflow poisons the WLC score
+  (§7)
+* Restarting with abrupt closes that RST in-flight clients (§4.8)
+* `pipe2()` per connection, doubling fd usage under fan-in (§14)
 
 Extensions (pick for follow-up interviews):
 * Upstream keep-alive pool with staleness validation — biggest real
@@ -554,4 +657,76 @@ Extensions (pick for follow-up interviews):
 * TLS frontend (OpenSSL BIOs over the existing pumps)
 * Dynamic config reload (SIGHUP) with connection draining
 * gRPC-style trailers / full chunked-request support (removes the 501)
-* Prometheus `/metrics` endpoint instead of stderr logs
+* Prometheus scraping already works internally at `/_proxima/metrics`
+  (§13); wiring it to a real Prometheus target + dashboards is config
+  work, not plumbing
+
+---
+
+## 13. SRE RED observability (hazard 7)
+
+`metrics.h` defines a process-wide, **cacheline-aligned** `struct
+px_metrics` (`g_metrics`), written only by the reactor thread. Hot
+counters (requests, status classes, bytes, active gauge) occupy the
+first cacheline; latency/anomaly accumulators live in a second
+`_Alignas(64)` section, so a future reader thread snapshot never shares
+a line with a writer. v1 is single-threaded by design — no atomics —
+and multi-process (reuseport) workers each own an instance.
+
+RED mapping (the interview framing):
+
+| RED | Field | Notes |
+|---|---|---|
+| Rate | `req_total` | requests whose head fully resolved (CS_SELECT) |
+| Errors | `req_5xx` + `internal_errors` | 5xx are client-visible; `internal_errors` are exchanges that died with NO status sent (aborted mid-flight). Invariant: `req_total == 1xx+2xx+3xx+4xx+5xx + internal_errors` — M5 tests assert it |
+| Duration | `upstream_connect_ns_sum/count/max` | RED latency = sum/count; max is the tail signal |
+
+Also exposed: `rx_bytes`/`tx_bytes`, `active_conns` gauge (guarded
+open/close — an extra close is an anomaly, never an underflow),
+`accounting_anomalies` (hazard 5) and `pipe_pool_starves` (hazard 4).
+
+Zero-allocation inspection, two ways:
+
+1. **Internal route** — a `GET /_proxima/metrics` request is intercepted
+   at request resolution *before* backend selection (no node
+   accounting, no pool pick): the proxy itself answers `200` with
+   `Content-Type: text/plain` rendered by `metrics_render()` into
+   `stage` (bounded, truncation-safe). Keep-alive semantics are normal.
+2. **SIGUSR1 dump** — the handler only sets a flag; the loop renders the
+   same text to stderr between epoll waits (no async-signal-unsafe work
+   in the handler).
+
+Access logs stay (one line per request) for request-level debugging;
+RED counters are what dashboards and the interview chart use.
+
+---
+
+## 14. Zero-copy fast path: splice(2) over a shared pipe pool (hazard 4)
+
+`splice()` moves bytes between two fds without touching userspace, but
+it needs a kernel pipe — and `pipe2()` per connection would double fd
+usage and churn kernel allocations at fan-in. `pipe_pool.h` fixes this:
+
+* `pipe_pool_init(max_pairs)` creates the pairs **once at startup**
+  (`O_NONBLOCK | O_CLOEXEC`); 0 disables the path entirely.
+* A conn **borrows** one pair on entering CS_RELAY (`pipe_r`/`pipe_w`,
+  -1 otherwise) and **releases** it on relay completion, disconnect, or
+  keep-alive loopback — borrow/release are freelist push/pop, **zero
+  syscalls in the hot path**.
+* The relay then alternates `splice(src → pipe)` / `splice(pipe → dst)`
+  while both sockets are splice-eligible and the body exceeds a size
+  threshold (config); heads and small bodies keep the mbuf path (fewer
+  syscalls beat "zero copy" at small sizes — that tradeoff is the M7
+  experiment).
+* **Degradation, never starvation:** if the pool is empty, the relay
+  falls back to ordinary mbuf streaming immediately — traffic is never
+  dropped or blocked over a pipe shortage; only
+  `g_metrics.pipe_pool_starves` increments so you can see the pool is
+  undersized. Sizing: `min(max_conns/4, 1024)` pairs.
+* The conn state machine is unaffected: splice is an *implementation*
+  of the CS_RELAY pumps behind `conn_pump_read/write`, chosen per
+  buffer state; ET invariants (§3.1) still govern interest.
+
+M7 validates it with the §11 bench: mbuf path vs splice path on a
+1 GiB transfer, reporting CPU% and `perf stat` — the write-up
+(3 things tried + why) is the interview artifact.

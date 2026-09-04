@@ -19,9 +19,24 @@
  *       - EPOLLOUT is armed only when a write actually blocked or a
  *         non-blocking connect() is in flight; it is dropped the moment
  *         the outbound queue drains.
+ *   * EPOLLRDHUP (hazard 3) is ALWAYS armed: loop_add()/loop_mod()
+ *     OR it into every conn-fd mask automatically, so callers must not
+ *     (and need not) pass it.  A bare FIN with no payload can otherwise
+ *     be missed in edge-triggered mode once EPOLLIN has fired -- and
+ *     half-close detection must not depend on a read() that never
+ *     arrives.  When RDHUP is reported, conn.c sets the matching *_eof
+ *     flag and transitions immediately (DESIGN.md section 3.1 rule 6).
  *   * Timers are absolute-deadline monotonic (px_now_ms) entries on an
  *     intrusive min-heap; the loop sleeps in epoll_wait until the
  *     nearest deadline.
+ *
+ * GRACEFUL DRAIN (hazard 6): on SIGTERM/SIGQUIT main() wakes the loop
+ * (eventfd) and calls loop_begin_drain().  The loop closes its
+ * listener(s), flips to LOOP_DRAINING, walks every registered conn
+ * calling conn_begin_drain() (idle keep-alive conns close now; active
+ * relays get the grace deadline and keep_alive_ok=0), and stops the
+ * loop when the conn list empties or the grace deadline fires -- never
+ * an abrupt RST storm.  See DESIGN.md section 4.8.
  */
 #ifndef PX_EVENT_H
 #define PX_EVENT_H
@@ -36,24 +51,53 @@ struct event_loop;
 struct loop_timer;
 
 /* Per-connection event delivery.  `events` is an epoll bitmask
- * (EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP) already normalized for the fd's
- * role; conn_handle_events() in conn.c runs the state machine. */
+ * (EPOLLIN/EPOLLOUT/EPOLLERR/EPOLLHUP/EPOLLRDHUP) normalized for the
+ * fd's role; conn_handle_events() in conn.c runs the state machine.
+ * RDHUP is always armed for conn fds (see header comment). */
 typedef void (*conn_event_cb)(struct event_loop *loop, struct conn *c,
                               enum fd_role role, uint32_t events);
+
+/* Accept callback for listener fds.  `lfd` is the listener; the
+ * callback accepts in a loop until EAGAIN (ET) and hands each new fd
+ * to conn_accept().  The callback may test loop_phase() == LOOP_DRAINING
+ * and stop accepting. */
+typedef void (*accept_cb)(struct event_loop *loop, int lfd);
 
 typedef void (*timer_cb)(struct event_loop *loop, struct loop_timer *t,
                          void *arg);
 
+/* Reactor phase -- the graceful-shutdown state machine (hazard 6). */
+enum loop_phase {
+    LOOP_RUNNING = 0,   /* accepting + serving */
+    LOOP_DRAINING,      /* listener closed; finishing in-flight work */
+    LOOP_STOPPED        /* epoll_wait has returned; loop_run() unwinding */
+};
+
 struct event_loop *loop_new(int max_events);
 void loop_free(struct event_loop *loop);
 
-int loop_run(struct event_loop *loop);    /* returns when loop_stop()ed */
+int loop_run(struct event_loop *loop);    /* returns when stopped */
 void loop_stop(struct event_loop *loop);
 
 void loop_set_conn_cb(struct event_loop *loop, conn_event_cb cb);
 
+/* --- listener ------------------------------------------------------ */
+/* Register the listen socket.  The loop owns it from here on: it is
+ * closed by loop_begin_drain() (and loop_free()).  Returns 0 / -1. */
+int loop_add_listener(struct event_loop *loop, int lfd, accept_cb cb);
+
+/* --- graceful drain (hazard 6) ------------------------------------- */
+/* Stop accepting, grant in-flight conns `grace_ms` (from now) to reach
+ * CS_DONE, then terminate.  Idempotent.  See header comment + DESIGN
+ * section 4.8 for the per-conn behavior. */
+void loop_begin_drain(struct event_loop *loop, uint32_t grace_ms);
+
+enum loop_phase loop_phase(const struct event_loop *loop);
+
+/* --- conn fds ------------------------------------------------------ */
 /* Register / update / remove an fd owned by a conn.  The loop stores
- * (conn, role) alongside the fd and hands it back on every event. */
+ * (conn, role) alongside the fd and hands it back on every event.
+ * EPOLLRDHUP is OR'ed in automatically and must not be passed. */
 int loop_add(struct event_loop *loop, int fd, uint32_t events,
              struct conn *owner, enum fd_role role);
 int loop_mod(struct event_loop *loop, int fd, uint32_t events);

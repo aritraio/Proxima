@@ -7,6 +7,14 @@
  * SO_REUSEPORT workers, per-worker cursor/health state must be split
  * out (see DESIGN.md section 7).  Health state flips (UP<->DOWN) only
  * from the health-check machinery in health.c.
+ *
+ * DEFENSIVE ACCOUNTING (hazard 5): node->active feeds the WLC score,
+ * so an underflow would poison the balancer forever.  node_begin /
+ * node_end are static inline and underflow-guarded: a decrement on a
+ * zero counter is recorded as an accounting anomaly (node->anomalies
+ * and g_metrics) instead of wrapping to UINT64_MAX.  The anomaly is
+ * the bug surface -- find the double node_end(), never let it corrupt
+ * the balancer.
  */
 #ifndef PX_POOL_H
 #define PX_POOL_H
@@ -33,7 +41,7 @@ struct server_node {
     socklen_t               addrlen;
     char                    ident[128];   /* "127.0.0.1:9001" for logs */
 
-    int                     weight;       /* >= 1 */
+    int                     weight;       /* >= 1 (pool_add validates) */
     enum node_health        health;
 
     /* health-check bookkeeping (written by health.c) */
@@ -42,8 +50,10 @@ struct server_node {
 
     /* in-flight / lifetime counters (written by conn.c) */
     uint64_t active;      /* requests currently assigned to this node */
-    uint64_t total;       /* completed requests */
+    uint64_t total;       /* cleanly completed requests */
     uint64_t failed;      /* requests that ended in error/refused */
+    uint64_t anomalies;   /* accounting bugs observed on this node
+                             (double node_end, decrement on zero) */
 };
 
 struct server_pool {
@@ -67,11 +77,51 @@ int pool_add(struct server_pool *pool, const char *host, uint16_t port,
  * NH_CHECKING stays out of rotation until it recovers. */
 struct server_node *pool_pick(struct server_pool *pool);
 
-/* Accounting around a request's lifetime (called by conn.c):
- * node_begin() when a node is picked, node_end() when the conn closes. */
-void node_begin(struct server_node *node);
-void node_end(struct server_node *node, int ok);
-
 int pool_has_up_node(const struct server_pool *pool);
+
+/* ------------------------------------------------------------------ */
+/* Node accounting (inline: hot path, single thread, no locks).        */
+/* ------------------------------------------------------------------ */
+
+/* Call when a node is picked for a request (CS_SELECT). */
+static inline void node_begin(struct server_node *node)
+{
+    node->active++;
+}
+
+/*
+ * Call exactly once per request, when its conn reaches CS_DONE.
+ *   ok != 0 : request completed cleanly            -> total++
+ *   ok == 0 : request ended in error/refused       -> failed++
+ * Underflow guard: decrementing a zero counter is an internal bug;
+ * it is counted, not wrapped.
+ */
+static inline void node_end(struct server_node *node, int ok)
+{
+    if (node->active > 0) {
+        node->active--;
+        if (ok)
+            node->total++;
+        else
+            node->failed++;
+    } else {
+        /* Double node_end() / lost node_begin: the request was never
+         * counted here (or already was), so do NOT touch total/failed
+         * again -- surface the bug, keep the counters truthful. */
+        node->anomalies++;
+    }
+}
+
+/*
+ * WLC score: ceil(active * 1000 / weight) in integer arithmetic.
+ * Defensive: weight < 1 (should be impossible after pool_add
+ * validation) is clamped to 1 so the divisor is never zero and a
+ * misconfigured node can never produce a garbage score.
+ */
+static inline uint64_t node_lc_score(const struct server_node *node)
+{
+    uint32_t w = (node->weight >= 1) ? (uint32_t)node->weight : 1u;
+    return (node->active * 1000u) / w;
+}
 
 #endif /* PX_POOL_H */

@@ -5,9 +5,13 @@ balancer: non-blocking sockets, epoll edge-triggered, zero-copy payload
 relay, zero-allocation HTTP head parser, round-robin / weighted
 least-connections balancing, active health checks.
 
-**Status: M0 (skeleton).** Headers + design are in place; implementation
-follows the roadmap in [DESIGN.md](DESIGN.md) (M1 = mbuf + HTTP parser
-+ unit tests).
+**Status: M0.5 (hardening contracts).** M0 headers + smoke test, plus
+the M0.5 production-hardening pass: tiered buffer allocation, the
+compaction-safe parse invariant, always-armed EPOLLRDHUP, a splice pipe
+pool, defensive node accounting, the graceful-drain lifecycle, and
+cacheline-aligned RED metrics — all speced in [DESIGN.md](DESIGN.md)
+and enforced by `tests/header_smoke.c`. Implementation starts at M1
+(mbuf + HTTP parser + unit tests).
 
 ```
 make check            # compiles headers + smoke test (-Werror), runs it

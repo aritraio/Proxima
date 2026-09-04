@@ -7,12 +7,18 @@
  *  * The parser is a pure byte scanner.  It holds a cursor `pos` and
  *    optionally a few range offsets into the buffer being scanned.
  *    It NEVER allocates, NEVER copies, and NEVER touches the bytes.
- *  * The connection code feeds it the live region of an mbuf.  While a
- *    head is being parsed the connection code does NOT consume from the
- *    buffer, so "offset relative to buffer start" is stable across
- *    calls.  Between calls the buffer may only grow at the tail (new
- *    reads); if the tail is full the caller compacts, which is safe
- *    because nothing was consumed yet.
+ *
+ *  * OFFSET / COMPACTION INVARIANT (hazard 2): while a head is being
+ *    parsed the connection code does NOT consume from, and MUST NOT
+ *    mbuf_compact(), the buffer.  Recorded ranges ({off,len}) are
+ *    offsets from the message base -- the buffer position the parser
+ *    started at.  Between http_parse() calls the base may move ONLY by
+ *    realloc (mbuf_reserve_append), never by memmove, so every call
+ *    receives the current mbuf_head() as `base` and offsets recorded by
+ *    the call that completes the head are the only ones ever consumed.
+ *    http_parser_ranges_in_bounds() (below) is the debug backstop for
+ *    this invariant: it must hold after every http_parse() call.
+ *
  *  * Parsing stops exactly at the end of the head (blank line).  The
  *    caller then consumes `head_len` bytes and handles the body by
  *    framing rules (below), with whatever body bytes were over-read
@@ -136,6 +142,53 @@ struct http_parser {
 
 void http_parser_init(struct http_parser *p, enum http_kind kind);
 void http_parser_reset(struct http_parser *p);   /* reuse for next message */
+
+/*
+ * Invariant backstop (hazard 2).  Returns nonzero iff every offset the
+ * parser has recorded -- the scan cursor and all completed ranges --
+ * lies within a live region of `live_len` bytes (i.e. within
+ * [mbuf_head, mbuf_head + live_len) of the buffer being scanned).
+ * Completed ranges are additionally required to sit inside the already-
+ * scanned prefix p->pos, which is where they were actually read from.
+ *
+ * The connection code calls this after every http_parse() feed in debug
+ * builds; a violation means the buffer was compacted/consumed under the
+ * parser.  Static inline so tests can exercise it without linking.
+ */
+static inline int http_parser_ranges_in_bounds(const struct http_parser *p,
+                                               size_t live_len)
+{
+    uint64_t pos;
+    size_t   i;
+
+    if (p->pos > live_len || p->nheaders > PX_MAX_HEADERS)
+        return 0;
+    pos = (uint64_t)p->pos;
+
+/* A range is valid iff it is unset (PX_RANGE_NONE sentinel) or ends
+ * within the scanned prefix.  Unset ranges have off == UINT32_MAX and
+ * must not trigger the arithmetic below. */
+#define PX_RANGE_IN_SCAN(r) \
+    (((r).len == 0 && (r).off == UINT32_MAX) || \
+     ((uint64_t)(r).off + (r).len <= pos))
+
+    if (!PX_RANGE_IN_SCAN(p->method)) return 0;
+    if (!PX_RANGE_IN_SCAN(p->target)) return 0;
+    if (!PX_RANGE_IN_SCAN(p->version)) return 0;
+    if (!PX_RANGE_IN_SCAN(p->reason)) return 0;
+
+    for (i = 0; i < p->nheaders; i++) {
+        if (!PX_RANGE_IN_SCAN(p->hname[i])) return 0;
+        if (!PX_RANGE_IN_SCAN(p->hvalue[i])) return 0;
+    }
+    return 1;
+#undef PX_RANGE_IN_SCAN
+}
+
+/* Bounds contract used by the caller: every feed's live region begins
+ * at the message base and the parser cursor never exceeds it (checked
+ * above); additionally, head_len reported by http_resolve() equals
+ * p->pos. */
 
 /*
  * Scan bytes [base .. base+len).  The scanner only looks at bytes from

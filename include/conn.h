@@ -5,15 +5,22 @@
  * MODEL (full rationale + transition tables in DESIGN.md):
  *
  *   A conn owns two sockets (client downstream, upstream backend) and
- *   exactly three mbufs:
+ *   up to three mbufs, allocated in TIERS (hazard 1) so idle/slowloris
+ *   connections do not pin 256 KiB each:
  *
- *     c2u   client -> proxy -> upstream  (request head is parsed in
- *           place here, then consumed; request body streams through
- *           the same buffer, zero copy)
- *     u2c   upstream -> proxy -> client  (response head parsed in
- *           place, response body streams through)
+ *     c2u   client -> proxy -> upstream.  The ONLY buffer allocated at
+ *           conn_accept() (request-head ingestion must not wait on an
+ *           allocation).  Grows (up to prm.max_head) while the request
+ *           head is parsed; request body streams through it, zero copy.
+ *     u2c   upstream -> proxy -> client.  Unallocated (data == NULL)
+ *           until CS_SELECT allocates it via conn_alloc_buffers().
  *     stage rewritten outbound head (the ONLY deliberate copy; heads
- *           only, never payload)
+ *           only, never payload).  Also deferred to CS_SELECT.
+ *
+ *   The keep-alive loopback (row 20 in DESIGN.md) calls
+ *   conn_free_buffers(), returning u2c + stage to the allocator between
+ *   requests; c2u is retained (and compacted to index 0) so the next
+ *   request head starts fresh at offset 0 (hazard 2 invariant).
  *
  *   One master state (enum conn_state) describes the lifecycle; the
  *   small per-request flags (req_body_done, resp_done, ...) resolve
@@ -23,10 +30,22 @@
  *   the machine recomputes wanted interest per fd and calls loop_mod()
  *   only when the mask changed -- see conn_sync_interest().
  *
+ *   EOF MODEL (hazard 3): *_eof is set EITHER when read() returns 0 OR
+ *   -- without waiting for a read -- when the loop reports EPOLLRDHUP
+ *   (always armed).  EOF means "no more input will arrive", NOT "stop
+ *   relaying": buffered outbound data (e.g. u2c after the backend's
+ *   FIN) is still flushed before the conn closes.
+ *
  *   TIMING: conn->deadline_ms is an absolute monotonic deadline for the
  *   current phase (connect timeout while CONNECT, idle timeout
  *   elsewhere).  Any progress resets it.  One reusable loop_timer per
- *   conn fires it.
+ *   conn fires it.  During drain (hazard 6) the deadline is capped at
+ *   the drain grace deadline for in-flight conns.
+ *
+ *   SPLICE FAST PATH (hazard 4): pipe_r/pipe_w are -1 normally.  In
+ *   CS_RELAY a pair may be borrowed from the process-wide pipe pool; if
+ *   the pool is empty the relay degrades to mbuf streaming -- traffic
+ *   is never dropped over a pipe shortage.
  */
 #ifndef PX_CONN_H
 #define PX_CONN_H
@@ -113,17 +132,23 @@ struct conn {
     uint8_t  resp_done;               /* response fully relayed */
 
     /* --- stream health (per side) --- */
-    uint8_t  client_eof;              /* client read() returned 0 */
-    uint8_t  upstream_eof;            /* upstream read() returned 0 */
+    /* Set by read()==0 OR by an EPOLLRDHUP event without a read
+     * (hazard 3).  One-shot sticky per request/conn. */
+    uint8_t  client_eof;
+    uint8_t  upstream_eof;
     uint8_t  upstream_writable_ever;  /* connect succeeded */
+
+    /* --- splice pipe pair (hazard 4): -1 when not borrowed --------- */
+    int pipe_r;                       /* pipe read end,  or -1 */
+    int pipe_w;                       /* pipe write end, or -1 */
 
     /* --- keep-alive decision for the client link --- */
     uint8_t  keep_alive_ok;           /* true: loop back to CS_READ_REQ */
 
-    /* --- buffers (see model comment above) --- */
-    struct mbuf c2u;                  /* client -> upstream */
-    struct mbuf u2c;                  /* upstream -> client */
-    struct mbuf stage;                /* rewritten head staging */
+    /* --- buffers (see model comment above; TIERED, hazard 1) ------ */
+    struct mbuf c2u;      /* allocated in conn_accept()              */
+    struct mbuf u2c;      /* data==NULL until conn_alloc_buffers()   */
+    struct mbuf stage;    /* data==NULL until conn_alloc_buffers()   */
 
     /* --- per-conn accounting / logging --- */
     uint64_t t0_ms;                   /* accept() time */
@@ -136,9 +161,34 @@ struct conn {
 /* ------------------------------------------------------------------ */
 
 /* Take ownership of an accepted client fd and enter CS_ACCEPTED.
- * Registers cfd with the loop (EPOLLIN).  Returns NULL on OOM. */
+ * Registers cfd with the loop (EPOLLIN) and allocates c2u (the only
+ * buffer an idle conn holds).  Returns NULL on OOM. */
 struct conn *conn_accept(struct event_loop *loop, int cfd,
                          const struct conn_params *prm);
+
+/* TIERED BUFFERS (hazard 1).  conn_alloc_buffers() must be called on
+ * CS_SELECT entry, after the request head is parsed and the backend is
+ * chosen: it allocates u2c + stage (c2u already exists).  Idempotent:
+ * buffers that are already allocated are left alone.
+ * Returns PX_OK, or PX_ERR on OOM (caller replies 500/503 and closes).
+ *
+ * conn_free_buffers() releases u2c + stage only -- called on the
+ * keep-alive loopback so an idle keep-alive conn holds just c2u.
+ * conn_close() destroys ALL buffers including c2u. */
+int  conn_alloc_buffers(struct conn *c);
+void conn_free_buffers(struct conn *c);
+
+/* GRACEFUL DRAIN (hazard 6), called by the loop for every live conn
+ * when loop_begin_drain() runs:
+ *   - completely idle conns (CS_READ_REQ, no buffered or partial
+ *     request bytes, fresh parser) are closed immediately;
+ *   - conns with a request in flight (CS_SELECT..CS_RELAY) keep
+ *     working but keep_alive_ok is forced to 0 (the next response head
+ *     advertises Connection: close, so the client sees a clean FIN)
+ *     and deadline_ms is capped at drain_deadline_ms;
+ *   - conns that already hold a partial request (started before the
+ *     drain) are allowed to finish that one exchange, then close. */
+void conn_begin_drain(struct conn *c, int64_t drain_deadline_ms);
 
 /* Event entry point: loop.c calls this for every (role, events) tuple.
  * Runs the state machine to quiescence (pumps until EAGAIN) and
@@ -159,7 +209,9 @@ uint32_t conn_want(struct conn *c, enum fd_role role);
  * nothing has been sent yet.  Idempotent. */
 void conn_abort(struct conn *c, int err_status);
 
-/* Close fds, account to node, unregister timers, free. */
+/* Close fds (releasing any borrowed pipe pair to the pool first),
+ * account to node (node_end), unregister timers, destroy all buffers
+ * (incl. c2u), free. */
 void conn_close(struct conn *c);
 
 const char *conn_state_name(enum conn_state s);   /* logging / tests */

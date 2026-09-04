@@ -1,0 +1,13 @@
+# --- build artifacts ---
+build/
+*.o
+*.d
+
+# --- editor / OS noise ---
+.DS_Store
+*.swp
+
+# --- profiling / bench output ---
+*.profraw
+*.out
+logs/

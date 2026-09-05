@@ -1,6 +1,8 @@
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -13,6 +15,77 @@
 #include "pool.h"
 
 extern struct server_pool *g_proxy_pool;
+
+/* Deterministic loopback helpers: never block indefinitely on accept/read.
+ * The proxy uses non-blocking sockets; the mock backend must do the same
+ * so `make check` cannot hang on TCP handshake timing. */
+static int set_nonblocking_tpl(int fd)
+{
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static int wait_readable_tpl(int fd, int timeout_ms)
+{
+    struct pollfd pfd;
+    int r;
+    if (fd < 0) return 0;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    r = poll(&pfd, 1, timeout_ms);
+    return (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0);
+}
+
+static int accept_nonblocking_tpl(int lfd)
+{
+    /* Poll for a pending connection (loopback connect is async for a
+     * non-blocking proxy ufd) then accept without blocking. Retries
+     * for up to ~2s; returns -1 on timeout. */
+    int i;
+    for (i = 0; i < 400; i++) {
+        int bfd;
+        if (wait_readable_tpl(lfd, 5)) {
+            bfd = accept(lfd, NULL, NULL);
+            if (bfd >= 0) return bfd;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        } else {
+            /* No edge yet: still try a non-blocking accept in case
+             * poll missed the edge, then sleep briefly. */
+            bfd = accept(lfd, NULL, NULL);
+            if (bfd >= 0) return bfd;
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != 0) {
+                /* poll timed out (0) -> accept raises EAGAIN; keep waiting */
+                if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+            }
+        }
+        usleep(5000);
+    }
+    return -1;
+}
+
+static ssize_t read_with_timeout_tpl(int fd, char *buf, size_t cap)
+{
+    /* Wait up to ~2s for data, then do a single read. Never blocks
+     * indefinitely: returns -1 on timeout. */
+    int i;
+    for (i = 0; i < 400; i++) {
+        ssize_t n;
+        if (!wait_readable_tpl(fd, 5)) {
+            usleep(5000);
+            continue;
+        }
+        n = read(fd, buf, cap);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(5000);
+            continue;
+        }
+        return n;
+    }
+    errno = ETIMEDOUT;
+    return -1;
+}
 
 static void on_conn_event(struct event_loop *loop, struct conn *c,
                           enum fd_role role, uint32_t events)
@@ -145,7 +218,8 @@ static void test_full_proxy_exchange(void)
     char buf[1024];
     ssize_t n;
 
-    /* 1. Setup mock backend TCP listener on ephemeral port */
+    /* 1. Setup mock backend TCP listener on ephemeral port.
+     * Non-blocking so accept() below can never hang the test. */
     lfd = socket(AF_INET, SOCK_STREAM, 0);
     assert(lfd >= 0);
     memset(&saddr, 0, sizeof saddr);
@@ -156,6 +230,7 @@ static void test_full_proxy_exchange(void)
     assert(listen(lfd, 4) == 0);
     assert(getsockname(lfd, (struct sockaddr *)&saddr, &slen) == 0);
     port = ntohs(saddr.sin_port);
+    assert(set_nonblocking_tpl(lfd) == 0);
 
     /* 2. Setup server pool pointing to this mock backend */
     assert(pool_init(&pool, 1, BAL_ROUND_ROBIN) == 0);
@@ -170,16 +245,18 @@ static void test_full_proxy_exchange(void)
     /* 4. Client sends request */
     assert(write(cfd[1], "GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n", 42) == 42);
 
-    /* 5. Dispatch client read event */
+    /* 5. Dispatch client read event (drives non-blocking connect). */
     conn_handle_events(c, FD_ROLE_CLIENT, 0x1);
 
-    /* 6. Accept upstream connection on mock backend */
-    bfd = accept(lfd, NULL, NULL);
+    /* 6. Accept upstream connection on mock backend. The proxy's connect()
+     * is non-blocking, so the SYN may not have arrived yet: poll + retry
+     * instead of a blocking accept() that would hang `make check`. */
+    bfd = accept_nonblocking_tpl(lfd);
     assert(bfd >= 0);
 
     /* 7. Proxy connects & flushes request head upstream */
     conn_handle_events(c, FD_ROLE_UPSTREAM, 0x4 /* OUT */);
-    n = read(bfd, buf, sizeof buf - 1);
+    n = read_with_timeout_tpl(bfd, buf, sizeof buf - 1);
     assert(n > 0);
     buf[n] = '\0';
     assert(strstr(buf, "GET /hello HTTP/1.1") != NULL);
@@ -189,11 +266,15 @@ static void test_full_proxy_exchange(void)
     /* 8. Backend responds with 200 OK + payload */
     assert(write(bfd, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld", 43) == 43);
 
-    /* 9. Upstream readable on proxy */
+    /* 9. Upstream readable on proxy. Wait until the proxy's upstream fd
+     * actually has the response bytes (loopback delivery is async) so the
+     * pump sees data instead of EAGAIN and the test stays deterministic. */
+    assert(c->ufd >= 0);
+    assert(wait_readable_tpl(c->ufd, 2000));
     conn_handle_events(c, FD_ROLE_UPSTREAM, 0x1 /* IN */);
 
-    /* 10. Client reads response */
-    n = read(cfd[1], buf, sizeof buf - 1);
+    /* 10. Client reads response (poll first: never block forever). */
+    n = read_with_timeout_tpl(cfd[1], buf, sizeof buf - 1);
     assert(n > 0);
     buf[n] = '\0';
     assert(strstr(buf, "HTTP/1.1 200 OK") != NULL);

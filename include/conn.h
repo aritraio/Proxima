@@ -120,9 +120,14 @@ struct conn {
     struct http_msg    req;           /* resolved request */
     uint64_t req_body_left;           /* BF_LENGTH: body bytes still to
                                          read from client */
+    uint64_t req_body_sent;           /* BF_LENGTH: body bytes already
+                                         forwarded upstream (bounds the
+                                         c2u drain so pipelined tail is
+                                         never sent as body, M6) */
     uint8_t  req_head_sent;           /* stage fully flushed upstream */
     uint8_t  req_body_done;           /* whole request body relayed */
     uint8_t  sent_100;                /* we already sent "100 Continue" */
+    uint8_t  retries;                 /* M6 idempotent retries used (max 1) */
 
     /* --- response side --- */
     struct http_parser presp;         /* response head scanner */

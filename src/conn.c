@@ -47,6 +47,8 @@ static void conn_timer_cb(struct event_loop *loop, struct loop_timer *timer, voi
 static void conn_sync_interest(struct conn *c);
 static void conn_advance_select(struct conn *c);
 static int conn_flush_stage_client(struct conn *c);
+static int conn_retry_allowed(const struct conn *c);
+static int conn_retry_connect(struct conn *c);
 
 const char *conn_state_name(enum conn_state s)
 {
@@ -81,7 +83,26 @@ static void conn_timer_cb(struct event_loop *loop, struct loop_timer *timer, voi
 
     c->timer = NULL;
     if (c->state == CS_CONNECT) {
-        if (c->node) node_end(c->node, 0);
+        /* M6: connect timeout is a connect failure -- retry idempotent
+         * requests once before giving up with 504. */
+        struct server_node *failed = c->node;
+        if (failed != NULL) {
+            if (g_health_checker) health_on_passive_failure(g_health_checker, failed);
+            node_end(failed, 0);
+            c->node = NULL;
+        }
+        if (c->ufd >= 0) {
+            loop_del(c->loop, c->ufd);
+            close(c->ufd);
+            c->ufd = -1;
+            c->want[FD_ROLE_UPSTREAM] = 0;
+        }
+        if (conn_retry_connect(c)) return;
+        /* Retry not possible (non-idempotent or already retried): 504. */
+        if (failed != NULL) {
+            /* Accounting already ended above; avoid double node_end in
+             * conn_abort by clearing node (already NULL). */
+        }
         conn_abort(c, 504);
     } else if (c->state == CS_READ_REQ) {
         conn_abort(c, 408);
@@ -201,7 +222,9 @@ uint32_t conn_want(struct conn *c, enum fd_role role)
             w |= PX_EV_OUT;
             break;
         case CS_RELAY:
-            if (!mbuf_is_empty(&c->c2u)) {
+            if (c->req.framing == BF_LENGTH &&
+                c->req_body_sent < c->req.body_len &&
+                !mbuf_is_empty(&c->c2u)) {
                 w |= PX_EV_OUT;
             }
             if (!c->upstream_eof && !c->resp_done && mbuf_tail_space(&c->u2c) > 0) {
@@ -424,14 +447,29 @@ int conn_pump_write(struct conn *c, enum fd_role role)
             }
             c->req_head_sent = 1;
         }
-        while (!mbuf_is_empty(&c->c2u)) {
-            ssize_t n = write(c->ufd, mbuf_head(&c->c2u), mbuf_len(&c->c2u));
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) return PX_AGAIN;
-                c->saved_errno = errno;
-                return PX_ERR;
+        /* M6 pipelining guard (DESIGN 4.5/5.5): c2u may hold pipelined
+         * bytes for the *next* request after the head was consumed.
+         * For BF_NONE (e.g. GET) there is no request body, so nothing in
+         * c2u belongs upstream. For BF_LENGTH, only body bytes belong
+         * upstream; any tail beyond the body is pipelined next-request
+         * data (from an initial over-read) and must stay buffered for
+         * the keep-alive loopback. req_body_sent bounds the drain. */
+        if (c->req.framing == BF_LENGTH && c->req_body_sent < c->req.body_len) {
+            uint64_t body_rem = c->req.body_len - c->req_body_sent;
+            while (!mbuf_is_empty(&c->c2u) && body_rem > 0) {
+                size_t chunk = mbuf_len(&c->c2u);
+                if ((uint64_t)chunk > body_rem) chunk = (size_t)body_rem;
+                ssize_t n = write(c->ufd, mbuf_head(&c->c2u), chunk);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) return PX_AGAIN;
+                    c->saved_errno = errno;
+                    return PX_ERR;
+                }
+                mbuf_consume(&c->c2u, (size_t)n);
+                c->req_body_sent += (uint64_t)n;
+                body_rem -= (uint64_t)n;
+                if ((size_t)n < chunk) return PX_AGAIN;
             }
-            mbuf_consume(&c->c2u, (size_t)n);
         }
         return PX_OK;
     }
@@ -540,11 +578,13 @@ static void handle_request_done(struct conn *c)
         memset(&c->req, 0, sizeof c->req);
         memset(&c->resp, 0, sizeof c->resp);
         c->req_body_left = 0;
+        c->req_body_sent = 0;
         c->req_head_sent = 0;
         c->req_body_done = 0;
         c->resp_body_left = 0;
         c->resp_done = 0;
         c->sent_100 = 0;
+        c->retries = 0;
         c->upstream_eof = 0;
         c->upstream_writable_ever = 0;
         c->err_status = 0;
@@ -563,6 +603,80 @@ static void handle_request_done(struct conn *c)
     } else {
         conn_close(c);
     }
+}
+
+static int conn_retry_allowed(const struct conn *c)
+{
+    /* M6 idempotent retry: GET/HEAD only, max 1, and only before anything
+     * was sent upstream or to the client (safe replay: head + optional
+     * body still fully buffered in stage/c2u). */
+    if (c == NULL || c->retries >= 1) return 0;
+    if (c->req.method != HTTP_M_GET && c->req.method != HTTP_M_HEAD) return 0;
+    if (c->req_head_sent) return 0;
+    if (c->tx_bytes != 0) return 0;
+    if (c->resp.head_len != 0) return 0;
+    return 1;
+}
+
+static int conn_retry_connect(struct conn *c)
+{
+    struct server_node *node;
+    int flags;
+
+    if (!conn_retry_allowed(c)) return 0;
+    c->retries++;
+
+    node = pool_pick(g_proxy_pool);
+    if (node == NULL) return 0;
+
+    c->node = node;
+    node_begin(c->node);
+    memcpy(&c->uaddr, &c->node->addr, c->node->addrlen);
+    c->uaddr_len = c->node->addrlen;
+
+    c->ufd = socket(c->uaddr.ss_family, SOCK_STREAM, 0);
+    if (c->ufd < 0) {
+        node_end(c->node, 0);
+        c->node = NULL;
+        return 0;
+    }
+    flags = fcntl(c->ufd, F_GETFL, 0);
+    if (flags >= 0) fcntl(c->ufd, F_SETFL, flags | O_NONBLOCK);
+
+    if (connect(c->ufd, (struct sockaddr *)&c->uaddr, c->uaddr_len) == 0) {
+        c->upstream_writable_ever = 1;
+        c->state = CS_SEND_REQ_HEAD;
+        if (loop_add(c->loop, c->ufd, PX_EV_OUT, c, FD_ROLE_UPSTREAM) != 0) {
+            close(c->ufd);
+            c->ufd = -1;
+            node_end(c->node, 0);
+            c->node = NULL;
+            return 0;
+        }
+        c->want[FD_ROLE_UPSTREAM] = PX_EV_OUT;
+        (void)conn_pump_write(c, FD_ROLE_UPSTREAM);
+        if (mbuf_is_empty(&c->stage)) c->state = CS_RELAY;
+    } else if (errno == EINPROGRESS) {
+        c->state = CS_CONNECT;
+        conn_set_timer(c, c->prm.connect_timeout_ms);
+        if (loop_add(c->loop, c->ufd, PX_EV_OUT, c, FD_ROLE_UPSTREAM) != 0) {
+            close(c->ufd);
+            c->ufd = -1;
+            node_end(c->node, 0);
+            c->node = NULL;
+            return 0;
+        }
+        c->want[FD_ROLE_UPSTREAM] = PX_EV_OUT;
+    } else {
+        if (g_health_checker) health_on_passive_failure(g_health_checker, c->node);
+        node_end(c->node, 0);
+        c->node = NULL;
+        close(c->ufd);
+        c->ufd = -1;
+        return 0;
+    }
+    conn_sync_interest(c);
+    return 1;
 }
 
 static void conn_advance_select(struct conn *c)
@@ -584,14 +698,19 @@ static void conn_advance_select(struct conn *c)
     if (loop_phase(c->loop) != LOOP_RUNNING) c->keep_alive_ok = 0;
     metrics_record_request(&g_metrics);
 
-    /* Check internal metrics route */
+    /* Check internal metrics route: record both counters BEFORE rendering
+     * so the snapshot satisfies total == classes + internal (the request
+     * itself is included). */
     if (c->req.method == HTTP_M_GET &&
         c->preq.target.len == PX_METRICS_PATH_LEN &&
         memcmp(mbuf_head(&c->c2u) + c->preq.target.off, PX_METRICS_PATH, PX_METRICS_PATH_LEN) == 0) {
         char body[4096];
         char head[256];
-        size_t blen = metrics_render(body, sizeof body);
-        int hlen = snprintf(head, sizeof head,
+        size_t blen;
+        int hlen;
+        metrics_record_status(&g_metrics, 200);
+        blen = metrics_render(body, sizeof body);
+        hlen = snprintf(head, sizeof head,
                             "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/plain\r\n"
                             "Content-Length: %zu\r\n"
@@ -602,7 +721,6 @@ static void conn_advance_select(struct conn *c)
         mbuf_append(&c->stage, head, (size_t)hlen);
         mbuf_append(&c->stage, body, blen);
         mbuf_consume(&c->c2u, c->req.head_len);
-        metrics_record_status(&g_metrics, 200);
         c->resp_done = 1;
         c->state = CS_RELAY;
         (void)conn_flush_stage_client(c);
@@ -621,12 +739,14 @@ static void conn_advance_select(struct conn *c)
 
     if (c->req.expect_continue && !c->sent_100) {
         static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
-        (void)write(c->cfd, cont, sizeof cont - 1);
+        ssize_t w = write(c->cfd, cont, sizeof cont - 1);
+        (void)w;
         c->sent_100 = 1;
     }
 
     if (c->req.framing == BF_LENGTH) {
         c->req_body_left = c->req.body_len;
+        c->req_body_sent = 0;
         if (mbuf_len(&c->c2u) >= c->req_body_left) {
             c->req_body_done = 1;
         } else {
@@ -634,6 +754,7 @@ static void conn_advance_select(struct conn *c)
         }
     } else {
         c->req_body_left = 0;
+        c->req_body_sent = 0;
         c->req_body_done = 1;
     }
 
@@ -651,7 +772,12 @@ static void conn_advance_select(struct conn *c)
 
     c->ufd = socket(c->uaddr.ss_family, SOCK_STREAM, 0);
     if (c->ufd < 0) {
-        node_end(c->node, 0);
+        struct server_node *failed = c->node;
+        node_end(failed, 0);
+        c->node = NULL;
+        /* Local fd exhaustion: retry is unlikely to help, but try once
+         * for idempotent methods before 502. */
+        if (conn_retry_connect(c)) return;
         conn_abort(c, 502);
         return;
     }
@@ -678,8 +804,17 @@ static void conn_advance_select(struct conn *c)
         }
         c->want[FD_ROLE_UPSTREAM] = PX_EV_OUT;
     } else {
-        if (g_health_checker) health_on_passive_failure(g_health_checker, c->node);
-        node_end(c->node, 0);
+        struct server_node *failed = c->node;
+        int saved = errno;
+        if (g_health_checker) health_on_passive_failure(g_health_checker, failed);
+        node_end(failed, 0);
+        c->node = NULL;
+        close(c->ufd);
+        c->ufd = -1;
+        c->want[FD_ROLE_UPSTREAM] = 0;
+        c->saved_errno = saved;
+        /* M6: idempotent retry (GET/HEAD, max 1) before 502. */
+        if (conn_retry_connect(c)) return;
         conn_abort(c, 502);
         return;
     }
@@ -726,10 +861,21 @@ int conn_handle_events(struct conn *c, enum fd_role role, uint32_t events)
                         conn_abort(c, c->preq.err_status ? c->preq.err_status : 400);
                         return PX_ERR;
                     }
+                    /* M6 timeouts audit: progress (bytes buffered) or
+                     * continued waiting both extend the idle deadline
+                     * while RUNNING (never during DRAINING grace). */
+                    if (loop_phase(c->loop) == LOOP_RUNNING)
+                        conn_set_timer(c, c->prm.idle_timeout_ms);
                 }
             } else if (c->state == CS_RELAY) {
-                (void)conn_pump_read(c, FD_ROLE_CLIENT);
-                (void)conn_pump_write(c, FD_ROLE_UPSTREAM);
+                int rr = conn_pump_read(c, FD_ROLE_CLIENT);
+                int wr = conn_pump_write(c, FD_ROLE_UPSTREAM);
+                /* Any activity reschedules the idle deadline (drain-safe:
+                 * only while RUNNING). */
+                if ((rr == PX_OK || rr == PX_AGAIN || wr == PX_OK ||
+                     wr == PX_AGAIN) &&
+                    loop_phase(c->loop) == LOOP_RUNNING)
+                    conn_set_timer(c, c->prm.idle_timeout_ms);
             }
         }
         if (EV_IS_OUT(events)) {
@@ -745,8 +891,16 @@ int conn_handle_events(struct conn *c, enum fd_role role, uint32_t events)
             int err = 0;
             socklen_t elen = sizeof err;
             if (getsockopt(c->ufd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
-                if (g_health_checker && c->node) health_on_passive_failure(g_health_checker, c->node);
-                if (c->node) node_end(c->node, 0);
+                struct server_node *failed = c->node;
+                if (g_health_checker && failed) health_on_passive_failure(g_health_checker, failed);
+                if (failed) node_end(failed, 0);
+                c->node = NULL;
+                loop_del(c->loop, c->ufd);
+                close(c->ufd);
+                c->ufd = -1;
+                c->want[FD_ROLE_UPSTREAM] = 0;
+                /* M6: retry idempotent connect failures once. */
+                if (conn_retry_connect(c)) return PX_OK;
                 conn_abort(c, 502);
                 return PX_ERR;
             }
@@ -768,7 +922,7 @@ int conn_handle_events(struct conn *c, enum fd_role role, uint32_t events)
         }
 
         if (EV_IS_IN(events)) {
-            (void)conn_pump_read(c, FD_ROLE_UPSTREAM);
+            int rr = conn_pump_read(c, FD_ROLE_UPSTREAM);
             if (!c->resp.head_len) {
                 enum http_parse_status st = http_parse(&c->presp, mbuf_head(&c->u2c),
                                                        mbuf_len(&c->u2c), c->prm.max_head);
@@ -817,6 +971,9 @@ int conn_handle_events(struct conn *c, enum fd_role role, uint32_t events)
                 }
             }
             (void)conn_pump_write(c, FD_ROLE_CLIENT);
+            if ((rr == PX_OK || rr == PX_AGAIN) &&
+                loop_phase(c->loop) == LOOP_RUNNING)
+                conn_set_timer(c, c->prm.idle_timeout_ms);
         }
 
         if (EV_IS_OUT(events)) {

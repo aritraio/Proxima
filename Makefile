@@ -14,10 +14,11 @@ INC      = -Iinclude
 BUILD    = build
 
 HEADERS := $(wildcard include/*.h)
+SRCS := src/buf.c src/http.c src/event.c src/metrics.c src/pool.c src/pipe_pool.c src/config.c src/health.c src/conn.c
 
-.PHONY: all check clean
+.PHONY: all check check-integration clean
 
-all: check
+all: $(BUILD)/pxlb $(BUILD)/origin check
 
 check: $(BUILD)/header_smoke $(BUILD)/test_buf $(BUILD)/test_http $(BUILD)/test_event $(BUILD)/test_metrics $(BUILD)/test_pool $(BUILD)/test_pipe_pool $(BUILD)/test_config $(BUILD)/test_health $(BUILD)/test_conn
 	@$(BUILD)/header_smoke
@@ -60,6 +61,15 @@ $(BUILD)/test_health: tests/test_health.c src/health.c src/pool.c src/config.c s
 
 $(BUILD)/test_conn: tests/test_conn.c src/conn.c src/buf.c src/http.c src/event.c src/metrics.c src/pool.c src/pipe_pool.c src/health.c $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) $(WARN) $(SAN) $(INC) tests/test_conn.c src/conn.c src/buf.c src/http.c src/event.c src/metrics.c src/pool.c src/pipe_pool.c src/health.c -o $@
+
+$(BUILD)/pxlb: src/main.c $(SRCS) $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) $(WARN) $(SAN) $(INC) src/main.c $(SRCS) -o $@
+
+$(BUILD)/origin: tests/origin.c $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) $(WARN) $(SAN) $(INC) tests/origin.c -o $@
+
+check-integration: $(BUILD)/pxlb $(BUILD)/origin
+	@bash scripts/e2e.sh
 
 $(BUILD):
 	mkdir -p $(BUILD)

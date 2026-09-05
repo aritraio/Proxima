@@ -371,7 +371,11 @@ size_t http_build_error_reply(char *dst, size_t cap, int status, uint8_t keep_al
     else if (status == 408) reason = "Request Timeout";
     else if (status == 414) reason = "URI Too Long";
     else if (status == 431) reason = "Request Header Fields Too Large";
+    else if (status == 501) reason = "Not Implemented";
     else if (status == 502) reason = "Bad Gateway";
+    else if (status == 503) reason = "Service Unavailable";
+    else if (status == 504) reason = "Gateway Timeout";
+    else if (status == 505) reason = "HTTP Version Not Supported";
     n = snprintf(dst, cap, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: %s\r\n\r\n",
                  status, reason, keep_alive ? "keep-alive" : "close");
     if (n < 0 || (size_t)n >= cap) return 0;

@@ -33,6 +33,8 @@ void config_defaults(struct proxy_config *cfg)
     cfg->health_fail_threshold = 3;
     snprintf(cfg->health_path, sizeof cfg->health_path, "/healthz");
 
+    cfg->splice_threshold = 0; /* M7 fast path off by default */
+
     cfg->nbackends = 0;
 }
 
@@ -142,6 +144,8 @@ int config_load(struct proxy_config *cfg, const char *path,
             cfg->health_fail_threshold = (uint32_t)strtoul(val, NULL, 10);
         } else if (strcmp(key, "health_path") == 0) {
             snprintf(cfg->health_path, sizeof cfg->health_path, "%s", val);
+        } else if (strcmp(key, "splice_threshold") == 0) {
+            cfg->splice_threshold = (size_t)strtoul(val, NULL, 10);
         } else if (strcmp(key, "backend") == 0) {
             char target[128] = {0};
             int weight = 1;

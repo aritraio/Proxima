@@ -173,11 +173,13 @@ static void do_reload(void)
     g_cfg_ptr->max_conns = ncfg.max_conns;
     g_cfg_ptr->max_head = ncfg.max_head;
     g_cfg_ptr->buf_cap = ncfg.buf_cap;
+    g_cfg_ptr->splice_threshold = ncfg.splice_threshold;
     g_conn_prm.max_head = ncfg.max_head;
     g_conn_prm.buf_cap = ncfg.buf_cap;
     g_conn_prm.stage_cap = ncfg.max_head * PX_STAGE_CAP_FACTOR;
     g_conn_prm.connect_timeout_ms = ncfg.connect_timeout_ms;
     g_conn_prm.idle_timeout_ms = ncfg.idle_timeout_ms;
+    g_conn_prm.splice_threshold = ncfg.splice_threshold;
     if (g_pool_ptr != NULL) g_pool_ptr->algo = ncfg.algo;
 
     /* Merge backends: add missing, refresh weights, mark removed DOWN.
@@ -391,6 +393,7 @@ int main(int argc, char **argv)
     g_conn_prm.stage_cap = cfg.max_head * PX_STAGE_CAP_FACTOR;
     g_conn_prm.connect_timeout_ms = cfg.connect_timeout_ms;
     g_conn_prm.idle_timeout_ms = cfg.idle_timeout_ms;
+    g_conn_prm.splice_threshold = cfg.splice_threshold;
 
     loop = loop_new(1024);
     if (loop == NULL) {

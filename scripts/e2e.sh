@@ -228,12 +228,12 @@ PY
 if [ $? -eq 0 ]; then ok "keep-alive reuse"; else bad "keep-alive reuse"; fi
 
 # 11. metrics endpoint: 200 text/plain + totals invariant
-METRICS_BODY=$(curl -s "$PX/_proxima/metrics" -H "Host: x" 2>/dev/null)
+curl -s "$PX/_proxima/metrics" -H "Host: x" -o /tmp/e_metrics.txt 2>/dev/null
 METRICS_CT=$(curl -s -o /dev/null -w "%{content_type}" "$PX/_proxima/metrics" -H "Host: x" 2>/dev/null)
 if echo "$METRICS_CT" | grep -q "text/plain"; then ok "metrics content-type"; else bad "metrics content-type" "got $METRICS_CT"; fi
-python3 - <<PY 2>&1 | grep -q INV_OK
+python3 - <<'PY' 2>&1 | grep -q INV_OK
 import re
-body = """$METRICS_BODY"""
+body = open("/tmp/e_metrics.txt").read()
 def num(pat):
     m = re.search(pat + r"\s+(\d+)", body)
     return int(m.group(1)) if m else None
@@ -248,7 +248,7 @@ assert total is not None, "no total"
 assert total == (c1+c2+c3+c4+c5+ie), f"{total} != {c1}+{c2}+{c3}+{c4}+{c5}+{ie}"
 print("INV_OK")
 PY
-if [ $? -eq 0 ]; then ok "metrics invariant total==classes+internal"; else bad "metrics invariant"; fi
+if [ $? -eq 0 ]; then ok "metrics invariant total==classes+internal"; else bad "metrics invariant" "$(cat /tmp/e_metrics.txt | tr '\n' ';' | cut -c1-500)"; fi
 
 # 12. backend toggle under load (kill one origin, proxy still serves via other)
 kill -STOP "$O1_PID" 2>/dev/null || kill "$O1_PID" 2>/dev/null

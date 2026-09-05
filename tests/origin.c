@@ -481,6 +481,14 @@ int main(int argc, char **argv)
             perror("accept");
             break;
         }
+        /* Accepted sockets inherit O_NONBLOCK from the listener on some
+         * platforms (macOS). The origin uses blocking I/O (fork per conn),
+         * so clear it here; otherwise the second keep-alive request sees
+         * EAGAIN instead of blocking and the conn resets. */
+        {
+            int fl = fcntl(cfd, F_GETFL, 0);
+            if (fl >= 0) fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
+        }
         pid = fork();
         if (pid < 0) {
             perror("fork");

@@ -88,6 +88,7 @@ struct conn_params {
     size_t   stage_cap;      /* >= 2 * max_head (rewrite worst case) */
     uint32_t connect_timeout_ms;
     uint32_t idle_timeout_ms;
+    size_t   splice_threshold; /* M7: 0 disables splice fast path */
 };
 
 struct conn {

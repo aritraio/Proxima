@@ -51,6 +51,11 @@ struct proxy_config {
     uint32_t health_fail_threshold;  /* consecutive fails to mark DOWN */
     char     health_path[128];       /* request target, e.g. /healthz */
 
+    /* zero-copy splice fast path (M7, DESIGN 14): bodies larger than
+     * this bypass the mbuf via splice(fd->pipe->fd). 0 disables the
+     * path entirely (default until the M7 experiment). */
+    size_t   splice_threshold;  /* bytes, 0 = mbuf only */
+
     /* backends (static list from the config file) */
     struct backend_cfg backends[PX_MAX_BACKENDS];
     size_t             nbackends;
